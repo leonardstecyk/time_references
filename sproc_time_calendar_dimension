@@ -1,0 +1,804 @@
+USE [TestDB]
+GO
+
+/****** Object:  StoredProcedure [dbo].[usp_CreateFiscalCalendar_Table]    Script Date: 10/2/2023 8:46:56 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+CREATE PROCEDURE [dbo].[usp_CreateFiscalCalendar_Table]
+
+AS
+
+SET NOCOUNT ON
+SET XACT_ABORT ON
+-- the first date of your 4-4-5 Fiscal Calendar
+DECLARE @StartDate date   = '12/29/2019'
+, @YearNumStop INT = 2050
+, @EndOfWeekDay VARCHAR(9) = 'Saturday';
+
+--sanity check
+IF OBJECT_ID('dbo.FiscalCalendar') IS NOT NULL
+	BEGIN
+		PRINT 'procedure aborted to prevent accidental overwrite of production table with code from the internet...';
+		THROW 51000, 'SANITY CHECK - you already have a dbo.FiscalCalendar table... either drop that table or update this procedure', 1;
+
+	END
+
+ELSE -- go forth
+
+/*
+this procedure will generate a fiscal calendar table for a data warehouse style dimension
+
+the first few steps will generate some temporary tables to use for referencing the 4/4/5 52/53 week fiscal logic.
+basically we need to reference how the logic should apply across qtrs, periods, and weeks when the year has 364 or 371 days
+
+after that we'll generate a tally table (basically the old school way of generating a sequence without using loops)
+the tally table will be used to apply an n+1 logic using set based logic.
+
+after that we'll leverage the start date and the max year you want to go to - in this case 2050
+
+then we'll create the main line table dbo.FiscalCalendar 
+then we'll leverage the sequence in the tally table to start building out the calendar
+once all the base line information is inserted, we'll start handling the updates for all the holidays.
+
+
+*/
+
+/* no the need to create a table if it doesn't already exist */
+IF OBJECT_ID('tempdb..#tmpFiscalQtrs') IS NOT NULL
+	DROP TABLE #tmpFiscalQtrs;
+
+CREATE TABLE #tmpFiscalQtrs (
+FiscalYearDaysNum SMALLINT
+, FiscalQtrNum TINYINT
+, FiscalQtrDaysNum TINYINT
+, RunningTotalQtrDaysNum SMALLINT
+, FiscalQtrTotalWeeksNum TINYINT
+)
+
+INSERT INTO #tmpFiscalQtrs (FiscalYearDaysNum, FiscalQtrNum, FiscalQtrDaysNum, RunningTotalQtrDaysNum, FiscalQtrTotalWeeksNum)
+VALUES (364, 1, 91, 91, 13)
+, (364, 2, 91, 182, 13)
+, (364, 3, 91, 273, 13)
+, (364, 4, 91, 364, 13)
+, (371, 1, 91, 91, 13)
+, (371, 2, 91, 182, 13)
+, (371, 3, 91, 273, 13)
+, (371, 4, 98, 371, 14);
+
+-- now we do periods
+IF OBJECT_ID('tempdb..#tmpFiscalPeriods') IS NOT NULL
+	DROP TABLE #tmpFiscalPeriods;
+
+CREATE TABLE #tmpFiscalPeriods (
+FiscalYearDaysNum SMALLINT
+, FiscalPeriodNum TINYINT
+, FiscalPeriodDaysNum TINYINT
+, RunningTotalPeriodDaysNum SMALLINT
+, FiscalQtrNum TINYINT
+, FiscalPeriodWeeksNum TINYINT
+);
+
+INSERT INTO #tmpFiscalPeriods (FiscalYearDaysNum, FiscalPeriodNum, FiscalPeriodDaysNum, RunningTotalPeriodDaysNum, FiscalQtrNum, FiscalPeriodWeeksNum)
+VALUES (364, 1, 28, 28, 1, 4)
+, (364, 2, 28, 56, 1, 4)
+, (364, 3, 35, 91, 1, 5)
+, (364, 4, 28, 119, 2, 4)
+, (364, 5, 28, 147, 2, 4)
+, (364, 6, 35, 182, 2, 5)
+, (364, 7, 28, 210, 3, 4)
+, (364, 8, 28, 238, 3, 4)
+, (364, 9, 35, 273, 3, 5)
+, (364, 10, 28, 301, 4, 4)
+, (364, 11, 28, 329, 4, 4)
+, (364, 12, 35, 364, 4, 5)
+, (371, 1, 28, 28, 1, 4)
+, (371, 2, 28, 56, 1, 4)
+, (371, 3, 35, 91, 1, 5)
+, (371, 4, 28, 119, 2, 4)
+, (371, 5, 28, 147, 2, 4)
+, (371, 6, 35, 182, 2, 5)
+, (371, 7, 28, 210, 3, 4)
+, (371, 8, 28, 238, 3, 4)
+, (371, 9, 35, 273, 3, 5)
+, (371, 10, 28, 301, 4, 4)
+, (371, 11, 35, 336, 4, 5)
+, (371, 12, 35, 371, 4, 5);
+
+
+-- now we do weeks
+IF OBJECT_ID('tempdb..#tmpFiscalWeeks') IS NOT NULL
+	DROP TABLE #tmpFiscalWeeks;
+
+CREATE TABLE #tmpFiscalWeeks (
+FiscalYearDaysNum SMALLINT
+, FiscalWeek TINYINT
+, RunningTotalFiscalWeekDays SMALLINT
+, FiscalPeriodNum TINYINT
+);
+
+INSERT INTO #tmpFiscalWeeks (FiscalYearDaysNum, FiscalWeek, RunningTotalFiscalWeekDays, FiscalPeriodNum)
+VALUES (364, 1, 7, 1)
+, (364, 2, 14, 1)
+, (364, 3, 21, 1)
+, (364, 4, 28, 1)
+, (364, 5, 35, 2)
+, (364, 6, 42, 2)
+, (364, 7, 49, 2)
+, (364, 8, 56, 2)
+, (364, 9, 63, 3)
+, (364, 10, 70, 3)
+, (364, 11, 77, 3)
+, (364, 12, 84, 3)
+, (364, 13, 91, 3)
+, (364, 14, 98, 4)
+, (364, 15, 105, 4)
+, (364, 16, 112, 4)
+, (364, 17, 119, 4)
+, (364, 18, 126, 5)
+, (364, 19, 133, 5)
+, (364, 20, 140, 5)
+, (364, 21, 147, 5)
+, (364, 22, 154, 6)
+, (364, 23, 161, 6)
+, (364, 24, 168, 6)
+, (364, 25, 175, 6)
+, (364, 26, 182, 6)
+, (364, 27, 189, 7)
+, (364, 28, 196, 7)
+, (364, 29, 203, 7)
+, (364, 30, 210, 7)
+, (364, 31, 217, 8)
+, (364, 32, 224, 8)
+, (364, 33, 231, 8)
+, (364, 34, 238, 8)
+, (364, 35, 245, 9)
+, (364, 36, 252, 9)
+, (364, 37, 259, 9)
+, (364, 38, 266, 9)
+, (364, 39, 273, 9)
+, (364, 40, 280, 10)
+, (364, 41, 287, 10)
+, (364, 42, 294, 10)
+, (364, 43, 301, 10)
+, (364, 44, 308, 11)
+, (364, 45, 315, 11)
+, (364, 46, 322, 11)
+, (364, 47, 329, 11)
+, (364, 48, 336, 12)
+, (364, 49, 343, 12)
+, (364, 50, 350, 12)
+, (364, 51, 357, 12)
+, (364, 52, 364, 12)
+, (371, 1, 7, 1)
+, (371, 2, 14, 1)
+, (371, 3, 21, 1)
+, (371, 4, 28, 1)
+, (371, 5, 35, 2)
+, (371, 6, 42, 2)
+, (371, 7, 49, 2)
+, (371, 8, 56, 2)
+, (371, 9, 63, 3)
+, (371, 10, 70, 3)
+, (371, 11, 77, 3)
+, (371, 12, 84, 3)
+, (371, 13, 91, 3)
+, (371, 14, 98, 4)
+, (371, 15, 105, 4)
+, (371, 16, 112, 4)
+, (371, 17, 119, 4)
+, (371, 18, 126, 5)
+, (371, 19, 133, 5)
+, (371, 20, 140, 5)
+, (371, 21, 147, 5)
+, (371, 22, 154, 6)
+, (371, 23, 161, 6)
+, (371, 24, 168, 6)
+, (371, 25, 175, 6)
+, (371, 26, 182, 6)
+, (371, 27, 189, 7)
+, (371, 28, 196, 7)
+, (371, 29, 203, 7)
+, (371, 30, 210, 7)
+, (371, 31, 217, 8)
+, (371, 32, 224, 8)
+, (371, 33, 231, 8)
+, (371, 34, 238, 8)
+, (371, 35, 245, 9)
+, (371, 36, 252, 9)
+, (371, 37, 259, 9)
+, (371, 38, 266, 9)
+, (371, 39, 273, 9)
+, (371, 40, 280, 10)
+, (371, 41, 287, 10)
+, (371, 42, 294, 10)
+, (371, 43, 301, 10)
+, (371, 44, 308, 11)
+, (371, 45, 315, 11)
+, (371, 46, 322, 11)
+, (371, 47, 329, 11)
+, (371, 48, 336, 11)
+, (371, 49, 343, 12)
+, (371, 50, 350, 12)
+, (371, 51, 357, 12)
+, (371, 52, 364, 12)
+, (371, 53, 371, 12);
+
+
+
+-- Generate a Series table 
+IF OBJECT_ID('tempdb..#tmpTally') IS NOT NULL
+	DROP TABLE #tmpTally;
+
+CREATE TABLE #tmpTally (
+n INT
+, m INT -- this is me being cheeky with n-1
+constraint PK_n_tmpTally primary key (n)
+);
+
+WITH Tally(n)
+	AS
+		(	-- expand if you need to - this will give you 13,824 records
+			-- the query execution plan will be misleading here... i promise it's efficient
+			SELECT ROW_NUMBER() OVER(ORDER BY (SELECT (NULL))) 
+			FROM (VALUES(0),(0),(0),(0),(0),(0),(0),(0)) AS a(n) -- x8 rows
+			CROSS JOIN (VALUES(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0)) AS b(n) -- x12 rows
+			CROSS JOIN (VALUES(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0)) AS c(n) -- x12 rows
+			CROSS JOIN (VALUES(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0),(0)) AS d(n) -- x12 rows
+			-- if you need more records copy the cross join and give it an alias of e(n)  
+	)
+
+INSERT INTO #tmpTally (n, m)
+SELECT n
+, n-1
+FROM TALLY
+ORDER BY n;
+
+IF OBJECT_ID('tempdb..#tmpFiscalYears') IS NOT NULL
+	DROP TABLE #tmpFiscalYears;
+
+CREATE TABLE #tmpFiscalYears (
+FiscalYearNum int 
+, FiscalYearDaysNum int
+, FiscalStartDate date
+, FiscalEndDate date
+);
+
+INSERT INTO #tmpFiscalYears (FiscalYearNum, FiscalYearDaysNum, FiscalStartDate, FiscalEndDate) 
+SELECT 
+YEAR(MAX(Date)) AS FiscalYear
+, DATEDIFF(DD, DATEADD(DD, -6, MIN(Date)), MAX(Date)) + 1 as YearDays
+, DATEADD(DD, -6, MIN(Date))  AS StartDate
+, MAX(Date) AS EndDate
+FROM (
+		SELECT DATEADD(DD, m, @startDate) AS Date
+		, DATENAME(WEEKDAY, DATEADD(DD, m, @StartDate)) AS WeekDayName
+		, YEAR(DATEADD(DD, m, @startDate)) AS YearNum
+		FROM #tmpTally
+      ) dates
+WHERE WeekDayName = @EndOfWeekDay AND YearNum <= @YearNumStop
+GROUP BY YearNum;
+
+/* now the need to create a table if it doesn't already exist */
+IF OBJECT_ID('dbo.FiscalCalendar') IS NOT NULL
+	DROP TABLE dbo.FiscalCalendar
+
+BEGIN 
+
+CREATE TABLE dbo.FiscalCalendar (
+DateKey INT NOT NULL
+, Date DATETIME NOT NULL
+, DateNameLong VARCHAR(30) NOT NULL
+, DateNameShort VARCHAR(12) NOT NULL
+
+, IsCalendarHoliday BIT NOT NULL
+, IsCompanyHoliday BIT NOT NULL
+, IsProductionHoliday BIT NOT NULL
+, RollingDayNum INT NOT NULL
+
+, YearNum SMALLINT NOT NULL
+, YearDayNum SMALLINT NOT NULL
+, YearDayRate NUMERIC(6,5) NOT NULL
+, YearTotalDaysNum SMALLINT NOT NULL
+
+, QtrNum TINYINT NOT NULL
+, QtrWeekNum TINYINT NOT NULL
+, QtrDayNum TINYINT NOT NULL
+, QtrTotalDaysNum TINYINT NOT NULL
+, QtrDayRate NUMERIC(6,5) NOT NULL
+
+, MonthNum TINYINT NOT NULL
+, MonthNameLong VARCHAR(9) NOT NULL
+, MonthNameShort CHAR(3) NOT NULL
+, MonthWeekNum TINYINT NOT NULL
+, MonthDayNum TINYINT NOT NULL
+, MonthDayRate NUMERIC(6,5) NOT NULL
+, MonthTotalDaysNum TINYINT NOT NULL
+, MonthEndDate DATETIME NOT NULL
+
+, WeekNum TINYINT NOT NULL
+, WeekDayNum TINYINT NOT NULL
+, WeekDayNameLong VARCHAR(9) NOT NULL
+, WeekDayNameShort CHAR(3) NOT NULL
+
+, FiscalYearNum SMALLINT NOT NULL
+, FiscalYearDayNum SMALLINT NOT NULL
+, FiscalYearDayRate NUMERIC(6,5) NOT NULL
+, FiscalYearTotalDaysNum SMALLINT NOT NULL
+, FiscalYearTotalWeeksNum TINYINT NOT NULL
+
+, FiscalQtrNum TINYINT NOT NULL
+, FiscalQtrDayNum TINYINT NOT NULL
+, FiscalQtrDayRate NUMERIC(6,5) NOT NULL
+, FiscalQtrTotalDaysNum TINYINT NOT NULL
+, FiscalQtrWeekNum TINYINT NOT NULL
+, FiscalQtrTotalWeeksNum TINYINT NOT NULL
+
+, FiscalPeriodNum TINYINT NOT NULL
+, FiscalPeriodDayNum TINYINT NOT NULL
+, FiscalPeriodDayRate NUMERIC(6,5) NOT NULL
+, FiscalPeriodTotalDaysNum TINYINT NOT NULL
+, FiscalPeriodEndDate DATETIME NOT NULL
+, FiscalPeriodWeekNum TINYINT NOT NULL
+, FiscalPeriodTotalWeeksNum TINYINT NOT NULL
+
+, FiscalWeekNum TINYINT NOT NULL
+, FiscalWeekDayNum TINYINT NOT NULL
+, FiscalWeekDayRate NUMERIC(6,5) NOT NULL
+, FiscalYYYYWW INT NOT NULL
+CONSTRAINT PK_DateKey_FiscalCalendar PRIMARY KEY (DateKey)
+);
+
+ALTER TABLE dbo.FiscalCalendar ADD CONSTRAINT DF_IsCalendarHoliday_FiscalCalendar DEFAULT(0) FOR IsCalendarHoliday;
+ALTER TABLE dbo.FiscalCalendar ADD CONSTRAINT DF_IsCompanyHoliday_FiscalCalendar DEFAULT(0) FOR IsCompanyHoliday;
+ALTER TABLE dbo.FiscalCalendar ADD CONSTRAINT DF_IsProductionHoliday_FiscalCalendar DEFAULT(0) FOR IsProductionHoliday;
+
+END
+
+;WITH cte_calStructure
+	AS
+		(
+			SELECT yrs.FiscalYearNum
+			, yrs.FiscalStartDate
+			, yrs.FiscalEndDate
+			, yrs.FiscalYearDaysNum
+			
+			, qtr.FiscalQtrNum
+			, qtr.FiscalQtrDaysNum
+			, QtrStartDate = DATEADD(DD, LEAD(qtr.RunningTotalQtrDaysNum - qtr.FiscalQtrDaysNum, 0, qtr.RunningTotalQtrDaysNum) OVER(ORDER BY yrs.FiscalYearNum, weeks.FiscalWeek), yrs.FiscalStartDate) 
+			, QtrEndDate = DATEADD(DD, qtr.RunningTotalQtrDaysNum - 1, yrs.FiscalStartDate)
+			, FiscalQtrWeekNum = ROW_NUMBER() OVER(PARTITION BY yrs.FiscalYearNum, prds.FiscalQtrNum ORDER BY yrs.FiscalYearNum, weeks.FiscalWeek)
+			, FiscalQtrTotalWeeksNum = qtr.FiscalQtrTotalWeeksNum
+
+			, prds.FiscalPeriodNum
+			, prds.FiscalPeriodDaysNum
+			, PeriodStartDate = DATEADD(DD, LEAD(prds.RunningTotalPeriodDaysNum - prds.FiscalPeriodDaysNum, 0, prds.RunningTotalPeriodDaysNum) OVER(ORDER BY yrs.FiscalYearNum, weeks.FiscalWeek), yrs.FiscalStartDate) 
+			, PeriodEndDate = DATEADD(DD, prds.RunningTotalPeriodDaysNum - 1, yrs.FiscalStartDate)
+			, prds.FiscalPeriodWeeksNum
+			, FiscalWeekPeriodNum = ROW_NUMBER() OVER(PARTITION BY yrs.FiscalYearNum, prds.FiscalPeriodNum ORDER BY yrs.FiscalYearNum, weeks.FiscalWeek)
+			
+			, weeks.FiscalWeek
+			, WeekStartDate = DATEADD(DD, LEAD(weeks.RunningTotalFiscalWeekDays - 7, 0, weeks.RunningTotalFiscalWeekDays) OVER(ORDER BY yrs.FiscalYearNum, weeks.FiscalWeek), yrs.FiscalStartDate) 
+			, WeekEndDate = DATEADD(DD, weeks.RunningTotalFiscalWeekDays - 1, yrs.FiscalStartDate)
+			FROM #tmpFiscalYears as yrs
+				INNER JOIN #tmpFiscalQtrs as qtr
+					ON yrs.FiscalYearDaysNum = qtr.FiscalYearDaysNum
+				INNER JOIN #tmpFiscalPeriods as prds
+					ON qtr.FiscalYearDaysNum = prds.FiscalYearDaysNum
+					AND qtr.FiscalQtrNum = prds.FiscalQtrNum
+				INNER JOIN #tmpFiscalWeeks as weeks
+					ON prds.FiscalYearDaysNum = weeks.FiscalYearDaysNum
+					AND prds.FiscalPeriodNum = weeks.FiscalPeriodNum
+		)
+
+
+INSERT INTO dbo.FiscalCalendar (
+DateKey
+, Date
+, DateNameLong
+, DateNameShort
+, RollingDayNum
+
+, YearNum
+, YearDayNum
+, YearDayRate
+, YearTotalDaysNum
+
+, QtrNum
+, QtrWeekNum
+, QtrDayNum
+, QtrDayRate
+, QtrTotalDaysNum
+
+, MonthNum
+, MonthNameLong
+, MonthNameShort
+, MonthWeekNum
+, MonthDayNum
+, MonthDayRate
+, MonthTotalDaysNum
+, MonthEndDate
+
+, WeekNum
+, WeekDayNum
+, WeekDayNameLong
+, WeekDayNameShort
+
+, FiscalYearNum
+, FiscalYearDayNum
+, FiscalYearDayRate
+, FiscalYearTotalDaysNum
+, FiscalYearTotalWeeksNum
+
+, FiscalQtrNum
+, FiscalQtrDayNum
+, FiscalQtrDayRate
+, FiscalQtrTotalDaysNum
+, FiscalQtrWeekNum
+, FiscalQtrTotalWeeksNum
+
+, FiscalPeriodNum
+, FiscalPeriodDayNum
+, FiscalPeriodDayRate
+, FiscalPeriodTotalDaysNum
+, FiscalPeriodWeekNum
+, FiscalPeriodTotalWeeksNum
+, FiscalPeriodEndDate
+
+, FiscalWeekNum
+, FiscalWeekDayNum
+, FiscalWeekDayRate
+, FiscalYYYYWW)
+
+
+SELECT  DateKey = FORMAT(DATEADD(DD, tally.m, @StartDate), 'yyyyMMdd')
+, Date = DATEADD(DD, tally.m, @StartDate)
+, DateNameLong = FORMAT(DATEADD(DD, tally.m, @StartDate), 'dddd, MMMM dd, yyyy')
+, DateNameShort = FORMAT(DATEADD(DD, tally.m, @StartDate), 'MMM dd, yyyy')
+, RollingDayNum = tally.n
+
+, YearNum = YEAR(DATEADD(DD, m, @StartDate))
+, YearDayNum = ROW_NUMBER() OVER(PARTITION BY YEAR(DATEADD(DD, m, @StartDate)) ORDER BY tally.n)
+, YearDayRate = CAST(ROW_NUMBER() OVER(PARTITION BY YEAR(DATEADD(DD, m, @StartDate)) ORDER BY tally.n) AS NUMERIC(6,3)) / DATEDIFF(DAY, DATEFROMPARTS(YEAR(DATEADD(DD, tally.m, @StartDate)), 1, 1), DATEFROMPARTS(YEAR(DATEADD(DD, tally.m, @StartDate)) + 1,1,1))
+, YearTotalDaysNum = DATEDIFF(DAY, DATEFROMPARTS(YEAR(DATEADD(DD, tally.m, @StartDate)), 1, 1), DATEFROMPARTS(YEAR(DATEADD(DD, tally.m, @StartDate)) + 1,1,1))
+
+, QtrNum = DATEPART(QUARTER, DATEADD(DD, tally.m, @StartDate))
+, QtrWeekNum = DATEPART(WK, DATEADD(DD,tally.m, @StartDate)) - DATEPART(WK, DATEADD(QQ, DATEDIFF(QQ, 0, DATEADD(DD, tally.m, @StartDate)), 0)) + 1
+, QtrDayNum = DATEDIFF(DAY, DATEADD(Q, DATEDIFF(Q, 0, DATEADD(DD, tally.m, @StartDate)), 0), DATEADD(DD, tally.m, @StartDate)) + 1 
+, QtrDayRate = CAST(DATEDIFF(DAY, DATEADD(QUARTER, DATEDIFF(QUARTER, 0,DATEADD(DD, m, @StartDate)), 0), DATEADD(DD, m, @StartDate)) + 1 AS NUMERIC(6,3)) / DATEDIFF(DD, DATEADD(QQ, DATEDIFF(QQ, 0, DATEADD(DD, tally.m, @StartDate)),0), DATEADD(QQ, DATEDIFF(QQ,0, DATEADD(DD, tally.m, @StartDate)) + 1,0))
+, QtrTotalDaysNum = DATEDIFF(DD, DATEADD(QQ, DATEDIFF(QQ, 0, DATEADD(DD, tally.m, @StartDate)),0), DATEADD(QQ, DATEDIFF(QQ,0, DATEADD(DD, tally.m, @StartDate)) + 1,0))
+
+, MonthNum = MONTH(DATEADD(DD, tally.m, @StartDate))
+, MonthNameLong = DATENAME(MM, DATEADD(DD, tally.m, @StartDate))
+, MonthNameShort = LEFT(DATENAME(MM, DATEADD(DD, tally.m, @StartDate)), 3)
+, MonthWeekNum =  DATEPART(WK, DATEADD(DD,tally.m, @StartDate)) - DATEPART(WK, DATEADD(MM, DATEDIFF(MM, 0, DATEADD(DD, tally.m, @StartDate)), 0)) + 1
+, MonthDayNum = DATEPART(DD, DATEADD(DD, tally.m, @StartDate))
+, MonthDayRate = CAST(DATEPART(DD, DATEADD(DD ,tally.m, @StartDate)) AS NUMERIC(6,3)) / DATEPART(DD, EOMONTH(DATEADD(DD,tally.m, @StartDate)))
+, MonthTotalDaysNum = DATEPART(DD, EOMONTH(DATEADD(DD, tally.m, @StartDate)))
+, MonthEndDate = EOMONTH(DATEADD(DD, tally.m, @StartDate))
+
+, WeekNum = DATEPART(wk, DATEADD(DD, tally.m, @StartDate))
+, WeekDayNum = DATEPART(dw, DATEADD(DD, tally.m, @StartDate))
+, WeekDayNameLong = DATENAME(WEEKDAY, DATEADD(DD, m, @StartDate))
+, WeekDayNameShort = LEFT(DATENAME(WEEKDAY, DATEADD(DD, m, @StartDate)), 3)
+
+, FiscalYearNum = cal.FiscalYearNum
+, FiscalYearDayNum = ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum ORDER BY tally.n)
+, FiscalYearDayRate = CAST(ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum ORDER BY tally.n) AS NUMERIC(6,3)) / cal.FiscalYearDaysNum
+, FiscalYearTotalDaysNum = cal.FiscalYearDaysNum
+, FisaclYearTotalWeeksNum = CASE WHEN cal.FiscalYearDaysNum = 364 THEN 52 WHEN cal.FiscalYearDaysNum = 371 THEN 53 END
+
+, FiscalQtrNum = cal.FiscalQtrNum
+, FiscalQtrDayNum = ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, cal.fiscalQtrNum ORDER BY tally.n)
+, FiscalQtrDayRate = CAST(ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, cal.fiscalQtrNum ORDER BY tally.n) AS NUMERIC(6,3)) / cal.FiscalQtrDaysNum
+, FiscalQtrTotalDaysNum = cal.FiscalQtrDaysNum
+, FiscalQtrWeekNum = cal.FiscalQtrWeekNum
+, FiscalQtrTotalWeeksNum = cal.FiscalQtrTotalWeeksNum
+
+, cal.FiscalPeriodNum
+, FiscalPeriodDayNum = ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, FiscalPeriodNum ORDER BY tally.n)
+, FiscalPeriodDateRate = CAST(ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, cal.FiscalPeriodNum ORDER BY tally.n) AS NUMERIC(6,3)) / cal.FiscalPeriodDaysNum
+, FiscalPeriodTotalDaysNum = cal.FiscalPeriodDaysNum
+, FiscalPeriodWeekNum = cal.FiscalWeekPeriodNum
+, FiscalPeriodTotalWeeksNum = cal.FiscalPeriodWeeksNum
+, FiscalPeriodEndDate = cal.PeriodEndDate 
+
+, FiscalWeekNum = cal.FiscalWeek
+, FiscalWeekDayNum = ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, cal.FiscalWeek ORDER BY tally.n)
+, FiscalWeekDayRate = (CAST(ROW_NUMBER() OVER(PARTITION BY cal.FiscalYearNum, cal.FiscalWeek ORDER BY cal.fiscalYearNum, cal.FiscalWeek) AS NUMERIC(6,3)) / 7.0)
+, FiscalYYYYWW = CAST(CAST(cal.FiscalYearNum AS CHAR(4)) + REPLICATE('0', 2-LEN(cal.FiscalWeek)) + CAST(cal.FiscalWeek AS VARCHAR(2)) AS INT)
+FROM #tmpTally as tally
+	INNER JOIN cte_calStructure as cal
+		ON DATEADD(DD, m, @StartDate) BETWEEN cal.WeekStartDate and cal.WeekEndDate
+ORDER BY Date;
+
+/*
+Calendar Holidays (Federal holidays)
+Static holidays are but these will be flagged based on when the date is observed.
+
+1/1 New Years
+7/4 Indy Day
+11/11 Veterans Day
+12/25 Xmas
+
+then there are those that are observed on some mondays
+Marting Luther King Jr is the 3rd monday in january
+Presidents' Day 3rd Monday in February
+Memorial Day is the last Monday in May
+Labor Day is the first Monday in September
+Columbus Day is observed the second Monday in October
+
+those holidays that fall relative to closest week day
+Juneteenth aka Freedom Day (June 19th official) if saturday then friday, if sunday then monday
+
+easter... not gonna lie, i took that from SQLShack 
+
+
+*/
+
+
+WITH cte_calHolidays (ObservedDate)
+	AS
+		(
+			-- new year's day
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar 
+			WHERE MonthNum = 1 AND MonthDayNum = 1
+			UNION
+			-- mlk day
+			SELECT Date
+			FROM 
+				(
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 1 AND WeekDayNum = 2
+				) as mlk
+			WHERE rn = 3
+			
+			UNION
+			-- prez day
+			SELECT Date
+			FROM 
+				(
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 2 AND WeekDayNum = 2
+				) as prez
+			WHERE rn = 3
+			
+			UNION 
+			-- memorial day
+			SELECT MAX(Date)
+			FROM dbo.FiscalCalendar
+			WHERE (MonthNum = 5 AND WeekDayNum = 2)
+			GROUP BY YearNum
+
+			UNION
+			-- juneteenth
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+						WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+						WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+						END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 6 AND MonthDayNum = 19
+
+			UNION 
+			-- indy day
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 7 AND MonthDayNum = 4
+
+			UNION
+			-- labor day
+			SELECT MIN(Date)
+			FROM dbo.FiscalCalendar
+			WHERE (MonthNum = 9 AND WeekDayNum = 2)
+			GROUP BY YearNum
+			
+			UNION
+			-- columbus day
+			SELECT Date
+			FROM 
+				(
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 10 AND WeekDayNum = 2
+				) as prez
+			WHERE rn = 2
+
+			UNION 
+			-- veterans day
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 11 AND MonthDayNum = 11
+			
+			UNION
+			-- thxgiving
+			SELECT Date
+			FROM (
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 11 and WeekDayNum = 5
+					) as thx
+			WHERE rn = 4
+			
+			UNION
+			-- xmas
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar 
+			WHERE MonthNum = 12 AND MonthDayNum = 25
+		)
+
+UPDATE dbo.FiscalCalendar
+SET IsCalendarHoliday = 1
+FROM dbo.FiscalCalendar as cal
+	INNER JOIN cte_calHolidays as hol
+		on cal.Date = hol.ObservedDate;
+
+-- i did want to flag easter in there as there may be seasonal aspect to this holiday related to demand
+UPDATE dbo.FiscalCalendar
+SET IsCalendarHoliday = 1
+FROM dbo.FiscalCalendar AS cal
+CROSS APPLY (SELECT cal.YearNum AS y) _y
+CROSS APPLY (SELECT y / 100 as c, y - 19 * (y / 19) AS n) _nc
+CROSS APPLY (SELECT (c - 17) / 25 AS k) _k
+CROSS APPLY (SELECT c - c/4 - (c - k)/3 + 19 *n + 15 AS i1) _i1
+CROSS APPLY (SELECT i1 - 30 * (i1 / 30) AS i2) _i2
+CROSS APPLY (SELECT i2 - (i2 / 28) * (1 - (i2 / 28) * (29 / (i2 + 1)) * ((21 - n) / 11)) AS i) _i
+CROSS APPLY (SELECT y + y / 4 + i + 2 - c + c / 4 AS j1) _j1
+CROSS APPLY (SELECT j1 - 7*(j1 / 7) AS j) _j
+CROSS APPLY (SELECT i - j AS el) _el
+CROSS APPLY (SELECT 3 + (el + 40) / 44 AS m) _m
+CROSS APPLY (SELECT el + 28 - 31*(m / 4) AS d) _d
+CROSS APPLY (SELECT DATEFROMPARTS(y, m, d) AS EasterSunday) _Easter
+WHERE cal.Date = EasterSunday;
+
+/* now let's take care of the production holidays */
+WITH cte_ProdHolidays (ObservedDate)
+	AS
+		(
+			-- xmas
+			SELECT Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 12 AND MonthDayNum = 25
+
+			UNION
+
+			-- thxgiving
+			SELECT Date
+			FROM (
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 11 and WeekDayNum = 5
+					) as thx
+			WHERE rn = 4
+		)
+
+UPDATE dbo.FiscalCalendar
+SET IsProductionHoliday = 1
+FROM dbo.FiscalCalendar as cal
+	INNER JOIN cte_ProdHolidays as prod
+		ON cal.Date = prod.ObservedDate;
+
+/* now company observed holidays */
+WITH cte_compHolidays (ObservedDate)
+	AS
+		(
+			-- new years
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 1 AND MonthDayNum = 1
+			
+			UNION
+			-- memorial day
+			SELECT MAX(Date)
+			FROM dbo.FiscalCalendar
+			WHERE (MonthNum = 5 AND WeekDayNum = 2)
+			GROUP BY YearNum
+
+			UNION
+			-- indy day
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar 
+			WHERE MonthNum = 7 AND MonthDayNum = 4
+
+			UNION
+			-- labor day
+			SELECT MIN(Date)
+			FROM dbo.FiscalCalendar
+			WHERE (MonthNum = 9 AND WeekDayNum = 2)
+			GROUP BY YearNum
+
+			UNION
+			-- thxgiving & black friday
+			SELECT Date
+			FROM (
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 11 and WeekDayNum = 5
+					) as thx
+			WHERE rn = 4
+			UNION
+			SELECT DATEADD(DD, 1, Date)
+			FROM (
+					SELECT Date
+					, rn = ROW_NUMBER() OVER(PARTITION BY YearNum ORDER BY Date)
+					FROM dbo.FiscalCalendar
+					WHERE MonthNum = 11 and WeekDayNum = 5
+					) as thx
+			WHERE rn = 4
+
+			UNION
+			-- xmas eve and xmas
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, -1, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, -2, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 12 AND MonthDayNum = 24
+			UNION
+			SELECT CASE WHEN WeekDayNameLong NOT IN ('Saturday', 'Sunday') THEN Date
+			WHEN WeekDayNameLong = 'Saturday' THEN DATEADD(DD, 2, Date)
+			WHEN WeekDayNameLong = 'Sunday' THEN DATEADD(DD, 1, Date)
+			END AS Date
+			FROM dbo.FiscalCalendar
+			WHERE MonthNum = 12 AND MonthDayNum = 25
+		)
+UPDATE dbo.FiscalCalendar
+SET IsCompanyHoliday = 1
+FROM dbo.FiscalCalendar AS cal
+	INNER JOIN cte_CompHolidays AS hol
+		ON cal.Date = hol.ObservedDate;
+
+/* clean up your temp tables */
+IF OBJECT_ID('tempdb..#tmpFiscalQtrs') IS NOT NULL
+	DROP TABLE #tmpFiscalQtrs;
+
+IF OBJECT_ID('tempdb..#tmpFiscalWeeks') IS NOT NULL
+	DROP TABLE #tmpFiscalWeeks;
+
+IF OBJECT_ID('tempdb..#tmpFiscalPeriods') IS NOT NULL
+	DROP TABLE #tmpFiscalPeriods;
+
+IF OBJECT_ID('tempdb..#tmpFiscalYears') IS NOT NULL
+	DROP TABLE #tmpFiscalYears;
+
+IF OBJECT_ID('tempdb..#tmpTally') IS NOT NULL
+	DROP TABLE #tmpTally;
+
+
+
+
+GO
+
+
